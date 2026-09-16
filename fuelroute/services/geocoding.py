@@ -97,11 +97,38 @@ class Geocoder:
             raise GeocodeError(f"photon request failed: {exc}") from exc
 
     @staticmethod
-    def _photon_point(payload: dict) -> Optional[tuple[float, float]]:
+    def _photon_point(payload: dict, query: str = "") -> Optional[tuple[float, float]]:
+        """First US feature; Photon does fuzzy matching, so guard it.
+
+        Two failure modes seen in production testing: a foreign query can
+        match a foreign place (no country filter on Photon's side), and a
+        garbage query can fuzzy-match an unrelated US place. Reject both.
+        """
+        import re as _re
+
         features = payload.get("features") or []
-        if not features:
+        us_features = [
+            f
+            for f in features
+            if str((f.get("properties") or {}).get("countrycode", "")).lower() == "us"
+        ]
+        if not us_features:
             return None
-        lon, lat = features[0]["geometry"]["coordinates"][:2]
+        tokens = {
+            t
+            for t in _re.split(r"[^a-z0-9]+", query.lower())
+            if len(t) >= 3 and t != "usa"
+        }
+        if len(tokens) >= 2:
+            props = us_features[0].get("properties") or {}
+            hay_words = {
+                w
+                for k in ("name", "city", "town", "village", "county", "state", "street", "district")
+                for w in _re.split(r"[^a-z0-9]+", str(props.get(k) or "").lower())
+            }
+            if not tokens & hay_words:
+                return None
+        lon, lat = us_features[0]["geometry"]["coordinates"][:2]
         return (float(lat), float(lon))
 
     def _photon_reverse(self, lat: float, lon: float) -> dict:
@@ -139,7 +166,7 @@ class Geocoder:
         point = None
         photon_q = query or ", ".join(p for p in (street, city, state, "USA") if p)
         if time.monotonic() < self._nom_down_until:
-            point = self._photon_point(self._photon_get("/api/", {"q": photon_q, "limit": 1}))
+            point = self._photon_point(self._photon_get("/api/", {"q": photon_q, "limit": 5}), photon_q)
         else:
             try:
                 results = self._get("/search", params)
@@ -147,7 +174,7 @@ class Geocoder:
                     point = (float(results[0]["lat"]), float(results[0]["lon"]))
             except GeocodeError:
                 self._nom_down_until = time.monotonic() + 300  # retry primary after 5 min
-                point = self._photon_point(self._photon_get("/api/", {"q": photon_q, "limit": 1}))
+                point = self._photon_point(self._photon_get("/api/", {"q": photon_q, "limit": 5}), photon_q)
         self._cache_set(key, {"point": point})
         return point
 
