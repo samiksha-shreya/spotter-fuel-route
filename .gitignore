@@ -1,0 +1,5 @@
+__pycache__/
+*.pyc
+data/geocode_cache.sqlite3
+*.log
+.venv/
