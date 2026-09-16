@@ -20,15 +20,15 @@ from fuelroute.geo import (
     sample_polyline,
 )
 from fuelroute.services.fuel import (
+    STATE_ABBR_TO_NAME,
     PlannedStop,
     candidate_stops,
     geocode_stop,
     normalize_city,
     plan_refuelling,
-    _state_abbr_to_name,
 )
 from fuelroute.services.geocoding import GeocodeError, get_geocoder
-from fuelroute.services.routing import RoutingError, get_route
+from fuelroute.services.routing import RoutingError, get_route, route_api_call_count
 
 # Corridor tuning
 _REVERSE_SAMPLE_MILES = 75.0   # probe spacing for state/city detection
@@ -49,9 +49,16 @@ def route_fuel(request):
         body = json.loads(request.body or "{}")
     except json.JSONDecodeError:
         return JsonResponse({"error": "Request body must be JSON."}, status=400)
+    if not isinstance(body, dict):
+        return JsonResponse({"error": "Request body must be a JSON object."}, status=400)
+    start_v, finish_v = body.get("start"), body.get("finish")
+    if not isinstance(start_v, str) or not isinstance(finish_v, str):
+        return JsonResponse(
+            {"error": "'start' and 'finish' must be strings (US city/address)."}, status=400
+        )
 
-    start_q = (body.get("start") or "").strip()
-    finish_q = (body.get("finish") or "").strip()
+    start_q = start_v.strip()
+    finish_q = finish_v.strip()
     if not start_q or not finish_q:
         return JsonResponse(
             {"error": "Provide both 'start' and 'finish' (US city/address strings)."},
@@ -68,10 +75,12 @@ def route_fuel(request):
         missing = "start" if not start else "finish"
         return JsonResponse({"error": f"Could not geocode the {missing} location within the USA."}, status=422)
 
+    routing_calls_before = route_api_call_count()
     try:
         route = get_route(start, finish)
     except RoutingError as exc:
         return JsonResponse({"error": str(exc)}, status=502)
+    routing_calls = route_api_call_count() - routing_calls_before
 
     geometry = route["geometry"]
     markers = cumulative_distances(geometry)
@@ -102,24 +111,30 @@ def route_fuel(request):
             "total_cost": 0.0,
             "note": "Route is within one tank of fuel; no fuel stops needed (vehicle starts full).",
         }
-        response["meta"] = _meta(started, geocoded_stops=0)
+        response["meta"] = _meta(started, geocoded_stops=0, routing_calls=routing_calls)
         return JsonResponse(response)
 
     # 1. Find the corridor: reverse-geocode route probes -> states + cities.
     probes = sample_polyline(geometry, markers, _REVERSE_SAMPLE_MILES)
     state_codes: set[str] = set()
     city_names: set[str] = set()
-    try:
-        for _, (lat, lon) in probes:
+    probe_failures = 0
+    for _, (lat, lon) in probes:
+        try:
             addr = geocoder.reverse(lat, lon)
-            if addr.get("state"):
-                code = _abbr_for_state(addr["state"])
-                if code:
-                    state_codes.add(code)
-            if addr.get("city"):
-                city_names.add(addr["city"])
-    except GeocodeError as exc:
-        return JsonResponse({"error": str(exc)}, status=502)
+        except GeocodeError:
+            probe_failures += 1  # one bad probe must not abort the request
+            continue
+        if addr.get("state"):
+            code = _abbr_for_state(addr["state"])
+            if code:
+                state_codes.add(code)
+        if addr.get("city"):
+            city_names.add(addr["city"])
+    if probe_failures and not state_codes and not city_names:
+        return JsonResponse(
+            {"error": "geocoding unavailable while mapping the route corridor"}, status=502
+        )
 
     # 2. Candidate truckstops: on a traversed highway or in a traversed
     #    locality, then prefiltered by their town's distance to the route.
@@ -128,33 +143,42 @@ def route_fuel(request):
     for stop in candidates:
         by_city.setdefault((stop.state, normalize_city(stop.city)), []).append(stop)
     kept: list = []
-    try:
-        for (state, city), city_stops in sorted(by_city.items()):
-            state_name = _state_abbr_to_name.get(state, state)
+    for (state, city), city_stops in sorted(by_city.items()):
+        state_name = STATE_ABBR_TO_NAME.get(state, state)
+        try:
             city_pt = geocoder.forward(query=f"{city_stops[0].city}, {state_name}, USA")
-            if city_pt is None or distance_to_polyline_miles(city_pt, geometry) <= _CITY_PREFILTER_MILES:
-                kept.extend(city_stops)
-    except GeocodeError as exc:
-        return JsonResponse({"error": str(exc)}, status=502)
+        except GeocodeError:
+            # Geocoder hiccup on one town: keep its stops rather than abort
+            # the whole request; the precise pin below still filters them.
+            kept.extend(city_stops)
+            continue
+        if city_pt is None or distance_to_polyline_miles(city_pt, geometry) <= _CITY_PREFILTER_MILES:
+            kept.extend(city_stops)
 
     # 3. Precise geocode per surviving stop (cached) and pin to a mile marker.
     pinned: list[PlannedStop] = []
-    try:
-        for stop in kept[: _MAX_GEOCODE_STOPS]:
+    geocode_failures = 0
+    for stop in kept[: _MAX_GEOCODE_STOPS]:
+        try:
             point = geocode_stop(geocoder, stop)
-            if point is None:
-                continue
-            if distance_to_polyline_miles(point, geometry) <= _CORRIDOR_RADIUS_MILES:
-                pinned.append(
-                    PlannedStop(
-                        stop=stop,
-                        lat=point[0],
-                        lon=point[1],
-                        mile_marker=mile_marker_for_point(point, geometry, markers),
-                    )
+        except GeocodeError:
+            geocode_failures += 1  # skip this stop; others may still pin
+            continue
+        if point is None:
+            continue
+        if distance_to_polyline_miles(point, geometry) <= _CORRIDOR_RADIUS_MILES:
+            pinned.append(
+                PlannedStop(
+                    stop=stop,
+                    lat=point[0],
+                    lon=point[1],
+                    mile_marker=mile_marker_for_point(point, geometry, markers),
                 )
-    except GeocodeError as exc:
-        return JsonResponse({"error": str(exc)}, status=502)
+            )
+    if geocode_failures and not pinned:
+        return JsonResponse(
+            {"error": "geocoding unavailable while locating fuel stops"}, status=502
+        )
 
     # 4. Cheapest refuelling plan.
     try:
@@ -180,12 +204,17 @@ def route_fuel(request):
         "total_cost": total_cost,
     }
     response["map_url"] = _google_maps_url(start_q, finish_q, planned)
-    response["meta"] = _meta(started, geocoded_stops=min(len(kept), _MAX_GEOCODE_STOPS))
+    response["meta"] = _meta(
+        started,
+        geocoded_stops=min(len(kept), _MAX_GEOCODE_STOPS),
+        routing_calls=routing_calls,
+        candidates_capped=len(kept) > _MAX_GEOCODE_STOPS,
+    )
     return JsonResponse(response)
 
 
 def _abbr_for_state(state_name: str) -> str | None:
-    for abbr, name in _state_abbr_to_name.items():
+    for abbr, name in STATE_ABBR_TO_NAME.items():
         if name.lower() == state_name.lower():
             return abbr
     return None
@@ -202,10 +231,11 @@ def _google_maps_url(start_q: str, finish_q: str, planned) -> str:
     return url
 
 
-def _meta(started: float, geocoded_stops: int) -> dict:
+def _meta(started: float, geocoded_stops: int, routing_calls: int = 1, candidates_capped: bool = False) -> dict:
     return {
         "elapsed_seconds": round(time.monotonic() - started, 2),
-        "routing_api_calls": 1,
+        "routing_api_calls": routing_calls,  # real HTTP calls; 0 when served from cache
         "stops_precisely_geocoded": geocoded_stops,
+        "candidates_capped": candidates_capped,  # True if the safety bound dropped candidates
         "geocoding": "served from persistent cache when warm",
     }

@@ -17,7 +17,9 @@ def normalize_highway(text: str) -> str | None:
     text = text.strip().upper()
     if not text or not any(ch.isdigit() for ch in text):
         return None
-    m = re.match(r"^([A-Z .]*?)\s*-?\s*(\d{1,3}[A-Z]?)(?:\s+(?:BUS|BUSINESS|LOOP|SPUR))?$", text)
+    # "Historic US 66" -> "US 66": strip the marker so both normalizers agree.
+    text = re.sub(r"^HISTORIC\s+", "", text)
+    m = re.match(r"^([A-Z .]*?)\s*-?\s*(\d{1,4}[A-Z]?)(?:\s+(?:BUS|BUSINESS|LOOP|SPUR))?$", text)
     if not m:
         return None
     cls = re.sub(r"[^A-Z]", "", m.group(1))
@@ -38,6 +40,12 @@ def normalize_highway(text: str) -> str | None:
 # Simple in-process cache: {(start, finish): (timestamp, payload)}
 _ROUTE_CACHE: dict[tuple, tuple[float, dict]] = {}
 _ROUTE_CACHE_TTL_SECONDS = 3600
+_ROUTE_CACHE_MAX = 64  # bounded: routes are ~100-300KB each
+_ROUTE_API_CALLS = 0  # real HTTP calls made (cache hits not counted)
+
+
+def route_api_call_count() -> int:
+    return _ROUTE_API_CALLS
 
 
 def get_route(start: tuple[float, float], finish: tuple[float, float]) -> dict:
@@ -87,5 +95,11 @@ def get_route(start: tuple[float, float], finish: tuple[float, float]) -> dict:
         "duration_seconds": route["duration"],
         "highways": highways,
     }
+    global _ROUTE_API_CALLS
+    _ROUTE_API_CALLS += 1
+    if len(_ROUTE_CACHE) >= _ROUTE_CACHE_MAX:
+        # Evict the oldest quarter rather than growing without bound.
+        for stale_key in sorted(_ROUTE_CACHE, key=lambda k: _ROUTE_CACHE[k][0])[: _ROUTE_CACHE_MAX // 4]:
+            del _ROUTE_CACHE[stale_key]
     _ROUTE_CACHE[key] = (time.monotonic(), payload)
     return payload

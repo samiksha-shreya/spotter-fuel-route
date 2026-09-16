@@ -31,6 +31,7 @@ class Geocoder:
         self._last_request_at = 0.0
         self._nom_down_until = 0.0  # sticky failover: skip Nominatim while it throttles us
         self._db = sqlite3.connect(settings.GEOCODE_CACHE_PATH, check_same_thread=False)
+        self._db.execute("PRAGMA journal_mode=WAL")
         self._db.execute(
             "CREATE TABLE IF NOT EXISTS geocode_cache (key TEXT PRIMARY KEY, payload TEXT NOT NULL)"
         )
@@ -148,10 +149,10 @@ class Geocoder:
     def forward(self, *, city: str = "", state: str = "", street: str = "", query: str = "") -> Optional[tuple[float, float]]:
         """Geocode a US address/place to (lat, lon); None when not found."""
         if query:
-            key = f"fwd|{query.strip().lower()}"
+            key = f"fwd2|{query.strip().lower()}"  # v2: fallback path hardened (US-only, token match)
             params: dict = {"q": query, "format": "json", "limit": 1, "countrycodes": "us"}
         else:
-            key = f"fwd|{street.lower()}|{city.lower()}|{state.lower()}"
+            key = f"fwd2|{street.lower()}|{city.lower()}|{state.lower()}"
             params = {
                 "street": street,
                 "city": city,
@@ -172,6 +173,9 @@ class Geocoder:
                 results = self._get("/search", params)
                 if isinstance(results, list) and results:
                     point = (float(results[0]["lat"]), float(results[0]["lon"]))
+                else:
+                    # Primary found nothing: try the fallback before giving up.
+                    point = self._photon_point(self._photon_get("/api/", {"q": photon_q, "limit": 5}), photon_q)
             except GeocodeError:
                 self._nom_down_until = time.monotonic() + 300  # retry primary after 5 min
                 point = self._photon_point(self._photon_get("/api/", {"q": photon_q, "limit": 5}), photon_q)

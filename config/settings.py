@@ -7,9 +7,11 @@ from pathlib import Path
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 
-SECRET_KEY = "assessment-local-only-not-a-secret"
-DEBUG = False
-ALLOWED_HOSTS = ["*"]
+import os
+
+SECRET_KEY = os.environ.get("SECRET_KEY", "assessment-local-only-not-a-secret")
+DEBUG = os.environ.get("DEBUG", "") == "1"
+ALLOWED_HOSTS = os.environ.get("ALLOWED_HOSTS", "localhost,127.0.0.1").split(",")
 
 INSTALLED_APPS = [
     "django.contrib.contenttypes",
@@ -26,7 +28,6 @@ WSGI_APPLICATION = "config.wsgi.application"
 DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
 
 # Service configuration (overridable via environment)
-import os
 
 FUEL_PRICE_CSV = os.environ.get(
     "FUEL_PRICE_CSV", str(BASE_DIR / "data" / "fuel-prices-for-be-assessment.csv")
@@ -41,8 +42,8 @@ PHOTON_URL = os.environ.get("PHOTON_URL", "https://photon.komoot.io")
 OSRM_URL = os.environ.get("OSRM_URL", "https://router.project-osrm.org")
 # Nominatim usage policy requires a descriptive User-Agent.
 HTTP_USER_AGENT = os.environ.get(
-    "HTTP_USER_AGENT", "spotter-fuel-route-assessment/1.0 (contact: samiksha1105@gmail.com)"
-)
+    "HTTP_USER_AGENT", "spotter-fuel-route-assessment/1.0"
+)  # Nominatim policy asks for a descriptive UA; set contact info via env in real deployments.
 
 VEHICLE_RANGE_MILES = 500.0
 VEHICLE_MPG = 10.0

@@ -52,21 +52,49 @@ def sample_polyline(points: Sequence[Point], markers: Sequence[float], step_mile
     return samples
 
 
-def distance_to_polyline_miles(point: Point, polyline: Iterable[Point]) -> float:
-    """Approximate distance from a point to a polyline (min over vertices).
+def _segment_distance_miles(p: Point, a: Point, b: Point) -> tuple[float, float]:
+    """Distance from p to segment a-b, and the projection fraction in [0, 1].
 
-    Route geometries from OSRM are dense (sub-mile spacing on highways), so
-    vertex distance is a good approximation and much cheaper than true
-    point-to-segment projection for corridor filtering.
+    Local equirectangular projection around p's latitude - accurate to
+    centimetres over the mile-scale segments OSRM returns.
     """
-    return min(haversine_miles(point, vertex) for vertex in polyline)
+    lat0 = math.radians(p[0])
+    kx = math.cos(lat0) * 69.093  # miles per degree lon at this latitude
+    ky = 68.703                    # miles per degree lat
+    ax, ay = (a[1] - p[1]) * kx, (a[0] - p[0]) * ky
+    bx, by = (b[1] - p[1]) * kx, (b[0] - p[0]) * ky
+    dx, dy = bx - ax, by - ay
+    seg2 = dx * dx + dy * dy
+    t = 0.0 if seg2 == 0 else max(0.0, min(1.0, -(ax * dx + ay * dy) / seg2))
+    px, py = ax + t * dx, ay + t * dy
+    return math.hypot(px, py), t
+
+
+def _segments(polyline):
+    pts = list(polyline)
+    return pts, zip(pts, pts[1:])
+
+
+def distance_to_polyline_miles(point: Point, polyline: Iterable[Point]) -> float:
+    """True distance from a point to a polyline (min over segments).
+
+    Vertex-only distance overestimates for stops near the midpoint of a long
+    straight segment (a stop 1 mile off the route mid-segment could measure
+    5+ miles and be wrongly dropped from the corridor), so project onto each
+    segment instead.
+    """
+    pts, segs = _segments(polyline)
+    if len(pts) == 1:
+        return haversine_miles(point, pts[0])
+    return min(_segment_distance_miles(point, a, b)[0] for a, b in segs)
 
 
 def mile_marker_for_point(point: Point, polyline: Sequence[Point], markers: Sequence[float]) -> float:
-    """Approximate mile marker of a point along the route (nearest vertex)."""
-    best_i, best_d = 0, float("inf")
-    for i, vertex in enumerate(polyline):
-        d = haversine_miles(point, vertex)
+    """Mile marker of a point along the route (projected onto the nearest segment)."""
+    best_d, best_mile = float("inf"), 0.0
+    for i in range(1, len(polyline)):
+        d, t = _segment_distance_miles(point, polyline[i - 1], polyline[i])
         if d < best_d:
-            best_i, best_d = i, d
-    return markers[best_i]
+            best_d = d
+            best_mile = markers[i - 1] + t * (markers[i] - markers[i - 1])
+    return best_mile

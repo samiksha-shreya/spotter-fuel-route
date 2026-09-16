@@ -6,14 +6,13 @@ The OPIS CSV ships without coordinates, so stop locations are geocoded lazily
 from __future__ import annotations
 
 import csv
-import heapq
 import re
 import threading
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 from django.conf import settings
 
-_state_abbr_to_name = {
+STATE_ABBR_TO_NAME = {
     "AL": "Alabama", "AK": "Alaska", "AZ": "Arizona", "AR": "Arkansas", "CA": "California",
     "CO": "Colorado", "CT": "Connecticut", "DE": "Delaware", "FL": "Florida", "GA": "Georgia",
     "HI": "Hawaii", "ID": "Idaho", "IL": "Illinois", "IN": "Indiana", "IA": "Iowa",
@@ -84,7 +83,7 @@ def load_stops() -> dict[str, list[FuelStop]]:
 
 
 _ADDR_HWY_RE = re.compile(
-    r"\b(INTERSTATE|INT|IH|I|US|FM|RM|SH|SR|CR|HWY|HIGHWAY|STATE)\s*[-]?\s*(\d{1,3}[A-Z]?)\b", re.I
+    r"\b(INTERSTATE|INT|IH|I|US|FM|RM|SH|SR|CR|HWY|HIGHWAY|STATE)\s*[-]?\s*(\d{1,4}[A-Z]?)\b", re.I
 )
 
 
@@ -104,7 +103,7 @@ def geocode_stop(geocoder, stop: FuelStop) -> tuple[float, float] | None:
     OPIS addresses are often highway exits ('I-20, EXIT 283') which geocode
     poorly, so fall back to the business name, then the bare road junction.
     """
-    state_name = _state_abbr_to_name.get(stop.state, stop.state)
+    state_name = STATE_ABBR_TO_NAME.get(stop.state, stop.state)
     queries = [
         f"{stop.address}, {stop.city}, {stop.state}, USA",
         f"{stop.name}, {stop.city}, {stop.state}, USA",
@@ -118,31 +117,40 @@ def geocode_stop(geocoder, stop: FuelStop) -> tuple[float, float] | None:
 
 
 def candidate_stops(state_codes: set[str], city_names: set[str], highways: set[str] | None = None) -> list[FuelStop]:
-    """Truckstops worth geocoding: in a traversed state AND a traversed city.
+    """Truckstops worth geocoding along the traversed corridor.
 
-    A stop is a candidate when it sits on a highway the route actually uses
-    (address text match against the OSRM step refs) or in a locality the
-    reverse-geocoded route probes reported. This keeps the number of
-    rate-limited geocoding calls small instead of geocoding whole states
-    (Texas alone has ~800 stops in the file).
+    A stop is a candidate when it sits in a traversed locality (reverse-geocoded
+    route probes) or on a highway the route actually uses (address text match
+    against the OSRM step refs). Interstate and US-route tokens are matched
+    across ALL states: those corridors are nationally unique, and a route that
+    clips a state between two probes (a state too narrow for the probe spacing)
+    would otherwise lose every stop in it. State-highway tokens stay
+    state-scoped because "SH 5" exists in nearly every state.
+
+    This keeps the number of rate-limited geocoding calls small instead of
+    geocoding whole states (Texas alone has ~800 stops in the file).
     """
     by_state = load_stops()
     normalized_cities = {normalize_city(c) for c in city_names if c}
+    corridor_highways = {h for h in (highways or set()) if h.startswith(("I", "US"))}
     out: list[FuelStop] = []
-    for code in state_codes:
-        for stop in by_state.get(code, []):
-            if normalize_city(stop.city) in normalized_cities:
+    for code, stops in by_state.items():
+        in_state = code in state_codes
+        for stop in stops:
+            if in_state and normalize_city(stop.city) in normalized_cities:
                 out.append(stop)
-            elif highways and highway_tokens(stop.address) & highways:
-                out.append(stop)
+            elif highways:
+                tokens = highway_tokens(stop.address) & highways
+                if tokens and (in_state or tokens & corridor_highways):
+                    out.append(stop)
     return out
 
 
 def plan_refuelling(
     stops: list[PlannedStop],
     route_distance_miles: float,
-    range_miles: float = settings.VEHICLE_RANGE_MILES,
-    mpg: float = settings.VEHICLE_MPG,
+    range_miles: float | None = None,
+    mpg: float | None = None,
 ) -> tuple[list[PlannedStop], float]:
     """Minimum-cost refuelling plan along a one-dimensional route.
 
@@ -161,6 +169,10 @@ def plan_refuelling(
     Returns (stops with purchases, in route order, total_cost).
     Raises ValueError when the route is infeasible (fuel gap > range).
     """
+    # Resolve settings at call time, not import time, so tests and embedders
+    # can override them without reloading modules.
+    range_miles = settings.VEHICLE_RANGE_MILES if range_miles is None else range_miles
+    mpg = settings.VEHICLE_MPG if mpg is None else mpg
     capacity = range_miles / mpg
 
     # Collapse stops sharing a mile marker, keeping the cheapest.
