@@ -6,6 +6,7 @@ from a persistent cache wherever possible.
 from __future__ import annotations
 
 import json
+import math
 import time
 
 from django.conf import settings
@@ -21,6 +22,7 @@ from fuelroute.geo import (
 )
 from fuelroute.services.fuel import (
     STATE_ABBR_TO_NAME,
+    FuelStop,
     PlannedStop,
     candidate_stops,
     geocode_stop,
@@ -142,7 +144,13 @@ def route_fuel(request):
     by_city: dict[tuple[str, str], list] = {}
     for stop in candidates:
         by_city.setdefault((stop.state, normalize_city(stop.city)), []).append(stop)
-    kept: list = []
+    # Order survivors by position along the route (the city pin from the
+    # prefilter doubles as a free approximate mile marker), so the geocode
+    # budget below is spent across the whole corridor instead of an
+    # alphabetical slice of states. Without this, a long route can burn the
+    # entire cap on far-end states and report the start as infeasible.
+    positioned: list[tuple[float, FuelStop]] = []
+    unpositioned: list[FuelStop] = []
     for (state, city), city_stops in sorted(by_city.items()):
         state_name = STATE_ABBR_TO_NAME.get(state, state)
         try:
@@ -150,10 +158,20 @@ def route_fuel(request):
         except GeocodeError:
             # Geocoder hiccup on one town: keep its stops rather than abort
             # the whole request; the precise pin below still filters them.
-            kept.extend(city_stops)
+            unpositioned.extend(city_stops)
             continue
-        if city_pt is None or distance_to_polyline_miles(city_pt, geometry) <= _CITY_PREFILTER_MILES:
-            kept.extend(city_stops)
+        if city_pt is None:
+            unpositioned.extend(city_stops)
+        elif distance_to_polyline_miles(city_pt, geometry) <= _CITY_PREFILTER_MILES:
+            mile = mile_marker_for_point(city_pt, geometry, markers)
+            positioned.extend((mile, s) for s in city_stops)
+    positioned.sort(key=lambda pair: pair[0])
+    kept = [s for _, s in positioned] + unpositioned
+    if len(kept) > _MAX_GEOCODE_STOPS:
+        # Even stride along the whole route: full corridor coverage within
+        # the cap, so every 500-mile window keeps candidate stops.
+        stride = math.ceil(len(kept) / _MAX_GEOCODE_STOPS)
+        kept = kept[::stride]
 
     # 3. Precise geocode per surviving stop (cached) and pin to a mile marker.
     pinned: list[PlannedStop] = []
