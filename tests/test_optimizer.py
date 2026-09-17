@@ -102,7 +102,11 @@ class OptimizerTest(unittest.TestCase):
             planned, cost = plan_refuelling(stops, distance, RANGE, MPG)
             expected = brute_force(stops, distance)
             self.assertIsNotNone(expected)
-            self.assertAlmostEqual(cost, round(expected, 2), delta=0.05,
+            # Displayed gallons are rounded UP per stop so the published plan
+            # stays feasible; that adds <= 0.01 gal * price per stop over the
+            # exact LP optimum.
+            delta = 0.05 + 0.01 * 6.0 * max(1, len(planned))
+            self.assertAlmostEqual(cost, round(expected, 2), delta=delta,
                                    msg=f"trial {trial}: got {cost}, LP optimum {expected}")
 
 

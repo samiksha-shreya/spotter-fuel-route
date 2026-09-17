@@ -5,6 +5,8 @@ The OPIS CSV ships without coordinates, so stop locations are geocoded lazily
 """
 from __future__ import annotations
 
+import math
+
 import csv
 import re
 import threading
@@ -242,29 +244,30 @@ def plan_refuelling(
         if tank < -1e-9:
             raise ValueError("Internal error: negative tank - route infeasible.")
 
-    planned = []
-    total = 0.0
-    for mile, (stop, gallons) in purchases.items():
-        stop.gallons = round(gallons, 2)
-        stop.cost = round(gallons * stop.stop.price, 2)
-        total += stop.cost
-        planned.append(stop)
-    planned.sort(key=lambda s: s.mile_marker)
-
-    # Merge purchase rows that are effectively one fuelling event: adjacent
-    # stops (< 1 mile apart) at the same price fold into the earlier row, so
-    # the plan never shows a 0.02-gallon splash stop next to a real fill-up.
-    merged: list[PlannedStop] = []
-    for s in planned:
+    # Merge purchases that are effectively one fuelling event BEFORE
+    # rounding: adjacent stops (< 1 mile apart) at the same price fold into
+    # the earlier one, so the plan never shows a 0.02-gallon splash stop
+    # next to a real fill-up.
+    ordered = [v for _, v in sorted(purchases.items())]
+    merged: list[tuple[PlannedStop, float]] = []
+    for stop, gallons in ordered:
         if (
             merged
-            and abs(s.stop.price - merged[-1].stop.price) < 1e-9
-            and s.mile_marker - merged[-1].mile_marker < 1.0
+            and abs(stop.stop.price - merged[-1][0].stop.price) < 1e-9
+            and stop.mile_marker - merged[-1][0].mile_marker < 1.0
         ):
-            prev = merged[-1]
-            prev.gallons = round(prev.gallons + s.gallons, 2)
-            prev.cost = round(prev.cost + s.cost, 2)
+            prev_stop, prev_gallons = merged[-1]
+            merged[-1] = (prev_stop, prev_gallons + gallons)
         else:
-            merged.append(s)
-    planned = merged
+            merged.append((stop, gallons))
+
+    planned = []
+    total = 0.0
+    for stop, gallons in merged:
+        # Round gallons UP: rounding down can make a just-feasible plan look
+        # infeasible by a few thousandths of a gallon.
+        stop.gallons = math.ceil(gallons * 100 - 1e-9) / 100
+        stop.cost = round(stop.gallons * stop.stop.price, 2)
+        total += stop.cost
+        planned.append(stop)
     return planned, round(total, 2)
