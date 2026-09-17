@@ -25,6 +25,70 @@ class GeocodeError(Exception):
     pass
 
 
+
+
+_TOKEN_RE = None
+
+
+def _query_tokens(text: str) -> set[str]:
+    import re as _re
+    return {
+        t
+        for t in _re.split(r"[^a-z0-9]+", text.lower())
+        if len(t) >= 3 and t != "usa"
+    }
+
+
+def _levenshtein(a: str, b: str, cap: int = 3) -> int:
+    if abs(len(a) - len(b)) > cap:
+        return cap + 1
+    prev = list(range(len(b) + 1))
+    for i, ca in enumerate(a, 1):
+        cur = [i]
+        for j, cb in enumerate(b, 1):
+            cur.append(min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (ca != cb)))
+        prev = cur
+    return prev[-1]
+
+
+def _token_fuzzy_match(tokens: set[str], words: set[str]) -> bool:
+    for t in tokens:
+        for w in words:
+            if not w:
+                continue
+            if t in w or w in t:
+                return True
+            tol = 1 if min(len(t), len(w)) <= 4 else 2
+            if abs(len(t) - len(w)) <= tol and _levenshtein(t, w) <= tol:
+                return True
+    return False
+
+
+def _nominatim_match_ok(result: dict, query_text: str) -> bool:
+    """Guard Nominatim's fuzzy matching: a garbage query can fuzzy-match an
+    unrelated real place. Accept the match when it is a well-known place
+    (high importance) or shares at least one query token with the display
+    name (fuzzy token compare, so typos like 'Seattel' still match
+    'Seattle'). Single-token queries are accepted as-is."""
+    import re as _re
+
+    tokens = _query_tokens(query_text)
+    if len(tokens) < 2:
+        return True
+    try:
+        importance = float(result.get("importance") or 0.0)
+    except (TypeError, ValueError):
+        importance = 0.0
+    if importance >= 0.5:
+        return True
+    words = {
+        w
+        for w in _re.split(r"[^a-z0-9]+", str(result.get("display_name") or "").lower())
+        if w
+    }
+    return _token_fuzzy_match(tokens, words)
+
+
 class Geocoder:
     def __init__(self) -> None:
         self._lock = threading.Lock()
@@ -171,7 +235,7 @@ class Geocoder:
         else:
             try:
                 results = self._get("/search", params)
-                if isinstance(results, list) and results:
+                if isinstance(results, list) and results and _nominatim_match_ok(results[0], photon_q):
                     point = (float(results[0]["lat"]), float(results[0]["lon"]))
                 else:
                     # Primary found nothing: try the fallback before giving up.

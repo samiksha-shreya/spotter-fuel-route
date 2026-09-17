@@ -250,4 +250,21 @@ def plan_refuelling(
         total += stop.cost
         planned.append(stop)
     planned.sort(key=lambda s: s.mile_marker)
+
+    # Merge purchase rows that are effectively one fuelling event: adjacent
+    # stops (< 1 mile apart) at the same price fold into the earlier row, so
+    # the plan never shows a 0.02-gallon splash stop next to a real fill-up.
+    merged: list[PlannedStop] = []
+    for s in planned:
+        if (
+            merged
+            and abs(s.stop.price - merged[-1].stop.price) < 1e-9
+            and s.mile_marker - merged[-1].mile_marker < 1.0
+        ):
+            prev = merged[-1]
+            prev.gallons = round(prev.gallons + s.gallons, 2)
+            prev.cost = round(prev.cost + s.cost, 2)
+        else:
+            merged.append(s)
+    planned = merged
     return planned, round(total, 2)

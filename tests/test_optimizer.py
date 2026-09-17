@@ -108,3 +108,33 @@ class OptimizerTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class AdjacentMergeTest(unittest.TestCase):
+    """Adjacent same-price purchase rows fold into one fuelling event."""
+
+    def _stop(self, name, mile, price):
+        fs = FuelStop(name, name, "", "C", "TX", price)
+        return PlannedStop(stop=fs, lat=32.0, lon=-97.0, mile_marker=mile)
+
+    def _stops(self, with_adjacent):
+        stops = [
+            self._stop("A", 400.0, 3.00),
+            self._stop("C", 850.0, 3.00),
+            self._stop("D", 1300.0, 3.00),
+        ]
+        if with_adjacent:
+            stops.insert(1, self._stop("B", 400.1, 3.00))  # dust splash next to A
+        return stops
+
+    def test_adjacent_same_price_rows_merge(self):
+        # 1400 mi route, 500 mi range: retargeting past B leaves a 0.01-gal
+        # micro-purchase at B, which must fold into A's row.
+        planned, total = plan_refuelling(self._stops(True), 1400.0, range_miles=500.0, mpg=10.0)
+        self.assertEqual([s.stop.name for s in planned], ["A", "C", "D"])
+        self.assertAlmostEqual(planned[0].gallons, 40.0, places=1)
+        self.assertAlmostEqual(sum(s.gallons for s in planned), 90.0, places=1)
+
+    def test_distant_same_price_rows_stay_separate(self):
+        planned, _ = plan_refuelling(self._stops(False), 1400.0, range_miles=500.0, mpg=10.0)
+        self.assertEqual([s.stop.name for s in planned], ["A", "C", "D"])
